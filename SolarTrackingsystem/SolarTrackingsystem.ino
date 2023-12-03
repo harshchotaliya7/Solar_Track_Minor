@@ -25,7 +25,7 @@
 *              0x28 : Used for BNO055 - 9 axis Gyroscope
 */  
 
-///////////////// If offset Required in Elevation & Azimuth for correction with website
+///////////////// If offset Required in Elevation & Azimuth for correction with actual data from website
 #define elevation_offset 0.47
 #define azimuth_offset 1.16
 
