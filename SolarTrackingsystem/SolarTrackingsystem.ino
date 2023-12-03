@@ -4,6 +4,10 @@
 #include <SoftwareSerial.h>
 #include <LCD_I2C.h>
 #include <math.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+
 
 /************* Disclaimer ********************* 
 *  Minor Project 2023 
@@ -12,10 +16,22 @@
 ***********************************************
 *  Here RTC is used because whenever GPS is not  
 *  there then RTC is used for timining.
-*/
+***********************************************
+* Serial  : Used for Serial Monitor
+* Serial1 : Used for GPS - data
+* Serial2 : Used for Motor Driver
+* I2C : Addr - 0xA7 : Used for LCD 20x4
+*              0x68 : Used for RTC
+*              0x28 : Used for BNO055 - 9 axis Gyroscope
+*/  
 
-#define default_long  72.54
-#define default_lat   23.13
+///////////////// If offset Required in Elevation & Azimuth for correction with website
+#define elevation_offset 0.47
+#define azimuth_offset 1.16
+
+///////////////// Default value (Nirma University) if GPS signal is not found 
+#define default_long  72.54420  
+#define default_lat   23.12788
 
 ///////////////////// degree to radian
 #define DEG_TO_RAD   0.01744   
@@ -33,8 +49,13 @@
 #define GPS_    0
 #define RTC_    1
 
+//////////////////// Variable to print data whether on LCD or Serial Monitor
 #define LCD_    0
 #define SERIAL_  1
+
+#define BNO055_SAMPLERATE_DELAY_MS (100)
+
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 
 //////////////////////  I2C LCD 
 LCD_I2C lcd(0xA7,col_lcd,row_lcd); 
@@ -42,9 +63,23 @@ LCD_I2C lcd(0xA7,col_lcd,row_lcd);
 ///////////////////// RTC I2C ADDR - 0x68
 uRTCLib rtc(0x68);
 
+//////////////////// Variable for Refreshing the LCD data
 int prev_hour=0,prev_minute=0,prev_second=0;
-double latitude_=0,longitude_=0, ele_ang, azi_ang;
+
+//////////////////// Variable to hold the value of latitiude or longitude
+double latitude_=0,longitude_=0;
+
+//////////////////// Variable to hold current Elevation angle & Azimuth angle  
+double ele_ang, azi_ang;
+
+//////////////////// Variable to hold Julian Date Value
 long JDate;
+
+//////////////////// Varible to hold the value of every seconds (Used when we want to rotate the Solar Panel on particular interval of time)
+long seconds=0;
+
+///////////////// Variable to hold actual x_axis and y_axis angle 
+double current_x_axis_angle,current_y_axis_angle;
 
 //////////////////// Weak Days array
 char daysOfTheWeek[7][12] = {"Sun", "Monday", "Tuesday", "Wed", "Thursday", "Fri", "Saturday"};
@@ -52,7 +87,9 @@ char daysOfTheWeek[7][12] = {"Sun", "Monday", "Tuesday", "Wed", "Thursday", "Fri
 ////////////////// GPS Module (runs on Serial1)
 const uint32_t GPSBaud = 9600; 
 
+////////////////// Variable to hold UTC Time
 int UTCMinutes,UTCHours,dayofyear;
+
 ////////////////// UTC to local time converter function 
 int LocaltoUTCTime(int hour, int minute);
 
@@ -84,9 +121,27 @@ void setup() {
 
   ///////////////// RTC Initalization
   URTCLIB_WIRE.begin();
+
+  ///////////////// Sabertooth 
+  Serial2.begin(19200);
+  Serial2.write(64);
+
+/////////// 64 - forward positive 
+/////////// 64 - backward negative
+
+/////////// 191 - forward negative
+/////////// 191 - backward positive
+
+
+  while (!Serial) delay(10);  // wait for serial port to open!
+  if(!bno.begin())
+  {
+    Serial.print("Ooops, no BNO055 detected ... Check your wiring or I2C ADDR!");
+    while(1);
+  }
   
   ///////////////// First time manually set the RTC data when POWER ON
-  //rtc.set(50,23,18,5,26,10,23);
+  //rtc.set(50,52,20,6,01,12,23);
 }
 
 void loop() {
@@ -116,7 +171,6 @@ void loop() {
        
    }
    
-
   rtc.refresh();
 
   /*********************************************************************************
@@ -130,7 +184,23 @@ void loop() {
   ******************************************************/
   
   Calculate_Sun_Position(UTCHours,UTCMinutes,rtc.second(),rtc.day(),rtc.month(),rtc.year(),default_long,default_lat);
-   
+  
+  sensors_event_t event;
+  bno.getEvent(&event);
+  current_x_axis_angle=event.orientation.y;
+  current_y_axis_angle=event.orientation.z;
+
+  if(current_y_axis_angle>180)
+  {
+    current_y_axis_angle=current_y_axis_angle-360;
+  }
+
+  Serial.print(current_x_axis_angle);
+  Serial.print("     ");
+  Serial.println(current_y_axis_angle);
+
+  desire_angle_motor_direction(-20,ele_ang);
+  
   /******************************************************
   ************* To view Elevation Data on LCD ***********
   ******************************************************/ 
@@ -211,6 +281,7 @@ void loop() {
   if( (rtc.hour() != prev_hour) | (rtc.minute() != prev_minute) | (rtc.second() != prev_second) )
   {
     lcd.clear();
+    seconds++;
   }
 
   prev_hour=rtc.hour();
@@ -237,7 +308,7 @@ int LocaltoUTCTime(int hour, int minute)
 
 void Calculate_Sun_Position(int hour, int minute, int second, int day, int month, int year,float longitude , float latitude) 
 {
-  float T, JD_frac, L0, M, e, C, L_true, f, R, GrHrAngle, Obl, RA, Decl, HrAngle;
+  double T, JD_frac, L0, M, e, C, L_true, f, R, GrHrAngle, Obl, RA, Decl, HrAngle;
   long JDate, JDx;
   
   ////////// Julian Date
@@ -282,11 +353,11 @@ void Calculate_Sun_Position(int hour, int minute, int second, int day, int month
 
   ///////// Elevation Angle
   ele_ang  = asin(sin(latitude*DEG_TO_RAD) * sin(Decl) + cos(latitude*DEG_TO_RAD) * (cos(Decl) * cos(HrAngle)));
-  ele_ang = ele_ang / DEG_TO_RAD;
+  ele_ang = (ele_ang / DEG_TO_RAD)+ elevation_offset;
 
   ///////// Azimuth angle
   azi_ang  = PI + atan2(sin(HrAngle), cos(HrAngle) * sin(latitude*DEG_TO_RAD) - tan(Decl) * cos(latitude*DEG_TO_RAD)); 
-  azi_ang   = azi_ang   / DEG_TO_RAD + 0.6;
+  azi_ang   = (azi_ang   / DEG_TO_RAD) + azimuth_offset;
   
 }
 
@@ -313,6 +384,43 @@ void day_of_the_year(int day, int month, int year)
   }
 }
 
+void desire_angle_motor_direction(float desire_x_axis_angle,float desire_y_axis_angle)
+{
+  float x_diff = current_x_axis_angle - desire_x_axis_angle;
+  float y_diff = current_y_axis_angle - desire_y_axis_angle;
+  int speed_x,speed_y;
+  if(fabs(x_diff)>3)
+  {
+    if(x_diff > 0)
+    {
+      speed_x=-9;
+    }
+    else if(x_diff < 0)
+    {
+      speed_x=9;
+    }
+    Serial2.write(191 - speed_x);
+  }
+  else
+  {
+    speed_x=0;
+    Serial2.write(191);
+  }
+  if(fabs(y_diff)>3)
+  {
+    if (y_diff > 0) {
+      speed_y = 9;
+    } else if (y_diff < 0) {
+      speed_y = -9;
+    }
+    Serial2.write(64 - speed_y);
+  }
+  else 
+  {
+    speed_y=0;
+    Serial2.write(64);
+  } 
+}
 
 void Print_data(bool L_S,bool gpsorrtc)
 {
